@@ -117,21 +117,18 @@ def train_all_models() -> dict:
 
     models = {}
 
-    # Linear Regression
-    lr = LinearRegression()
-    lr.fit(X_train, y_train)
-    models["Linear Regression"] = {"model": lr, "metrics": _metrics(y_test, lr.predict(X_test))}
+    model_builders = {
+        "Linear Regression": lambda: LinearRegression(),
+        "Decision Tree": lambda: DecisionTreeRegressor(max_depth=8, min_samples_leaf=10, random_state=42),
+        "Random Forest": lambda: RandomForestRegressor(
+            n_estimators=200, max_depth=12, min_samples_leaf=5, n_jobs=-1, random_state=42
+        ),
+    }
 
-    # Decision Tree
-    dt = DecisionTreeRegressor(max_depth=8, min_samples_leaf=10, random_state=42)
-    dt.fit(X_train, y_train)
-    models["Decision Tree"] = {"model": dt, "metrics": _metrics(y_test, dt.predict(X_test))}
-
-    # Random Forest
-    rf = RandomForestRegressor(n_estimators=200, max_depth=12,
-                               min_samples_leaf=5, n_jobs=-1, random_state=42)
-    rf.fit(X_train, y_train)
-    models["Random Forest"] = {"model": rf, "metrics": _metrics(y_test, rf.predict(X_test))}
+    for name, build_model in model_builders.items():
+        mdl = build_model()
+        mdl.fit(X_train, y_train)
+        models[name] = {"model": mdl, "metrics": _metrics(y_test, mdl.predict(X_test))}
 
     # XGBoost
     if XGBOOST_AVAILABLE:
@@ -172,24 +169,21 @@ def predict_single(row_dict: dict, feat_cols: list[str], model) -> float:
 def build_forecast(df_full: pd.DataFrame, model, feat_cols: list[str],
                    days: int = 30) -> pd.DataFrame:
     """
-    Realistic multi-step daily revenue forecast.
+    Realistic multi-step daily revenue forecast with visible highs & lows.
 
-    Why forecasts looked flat before:
-      - lag_1/lag_7/rolling_mean all converge to the same value after a few steps,
-        so every future day gets identical features → identical predictions → flat line.
+    Approach — Seasonal Naive + Trend + Noise:
+      1. For each future date, find the SAME weekday from the last 4 matching
+         weeks in real history (e.g. forecasting next Monday → avg of last 4 Mondays).
+         This is called "Seasonal Naive" and naturally reproduces weekly patterns.
+      2. Apply a gentle trend from the last 60 days (not 14 — avoids end-of-data cliff).
+      3. Add realistic random variation (±8% of recent std) so the line has
+         natural-looking peaks and troughs, not a ruler-flat line.
 
-    Fix — three-layer approach:
-      1. BASE: model prediction using real historical lags (accurate anchor)
-      2. SEASONAL RATIO: multiply by the day-of-week pattern learned from history
-         (e.g. Sundays are historically 20% above average → Sunday forecasts get ×1.20)
-      3. TREND: apply a gentle linear trend from the last 14 days of real data
-         so the forecast slopes up/down naturally instead of being perfectly flat.
-
-    The lag features used for step i always look back into REAL history for
-    as long as possible, switching to prior predictions only when real data runs out.
-    This keeps the base prediction anchored to true historical scale.
+    The ML model is still used as a secondary signal — blended 30% with the
+    seasonal naive base (70%), because pure ML predictions flatten out due to
+    lag feature convergence.
     """
-    # ── Step 0: Aggregate raw data to daily totals ────────────────
+    # ── Aggregate to daily totals ─────────────────────────────────
     daily = (
         df_full.groupby("Date")
         .agg(Amount=("Amount", "sum"), Qty=("Qty", "mean"),
@@ -200,116 +194,117 @@ def build_forecast(df_full: pd.DataFrame, model, feat_cols: list[str],
         .reset_index(drop=True)
     )
     daily["DayOfWeek"] = daily["Date"].dt.dayofweek
+    daily["Month"]     = daily["Date"].dt.month
 
     last_date    = daily["Date"].max()
-    real_daily   = daily["Amount"].values.tolist()   # FROZEN — never modified
+    real_amounts = daily["Amount"].values          # numpy array, FROZEN
 
-    hist_mean    = float(np.mean(real_daily))
-    hist_mean_30 = float(np.mean(real_daily[-30:])) if len(real_daily) >= 30 else hist_mean
-    hist_std_30  = float(np.std(real_daily[-30:]))   if len(real_daily) >= 2  else hist_mean * 0.15
+    # Use median (robust to outliers) instead of mean for baseline
+    hist_median  = float(np.median(real_amounts))
+    # Use last 60 days for recent stats — avoids the end-of-data cliff
+    window       = min(60, len(real_amounts))
+    recent_vals  = real_amounts[-window:]
+    recent_mean  = float(np.mean(recent_vals))
+    recent_std   = float(np.std(recent_vals))
 
     top_category = daily.groupby("Category")["Amount"].sum().idxmax()
     top_state    = daily["ship-state"].value_counts().idxmax()
     avg_qty      = float(daily["Qty"].tail(14).mean())
 
-    # ── Step 1: Learn day-of-week seasonal ratios ─────────────────
-    # e.g. Monday avg = 0.95× overall mean, Sunday = 1.12× overall mean
-    dow_mean = daily.groupby("DayOfWeek")["Amount"].mean()
-    overall_mean = daily["Amount"].mean()
-    dow_ratio = (dow_mean / overall_mean).to_dict()   # {0: 0.95, 1: 1.02, ...}
-    # Fill any missing days with 1.0
+    # ── Day-of-week seasonal profile (from full history) ──────────
+    # e.g. {0: 720K, 1: 680K, ..., 6: 590K} — average per weekday
+    dow_profile = daily.groupby("DayOfWeek")["Amount"].median().to_dict()
+    dow_overall = float(np.median(list(dow_profile.values())))
+    dow_ratio   = {d: v / dow_overall for d, v in dow_profile.items()}
     for d in range(7):
         dow_ratio.setdefault(d, 1.0)
 
-    # ── Step 2: Learn monthly seasonal ratios ─────────────────────
-    daily["Month"] = daily["Date"].dt.month
-    month_mean  = daily.groupby("Month")["Amount"].mean()
-    month_ratio = (month_mean / overall_mean).to_dict()
+    # ── Month seasonal profile ────────────────────────────────────
+    month_profile = daily.groupby("Month")["Amount"].median().to_dict()
+    month_overall = float(np.median(list(month_profile.values())))
+    month_ratio   = {m: v / month_overall for m, v in month_profile.items()}
     for m in range(1, 13):
         month_ratio.setdefault(m, 1.0)
 
-    # ── Step 3: Compute linear trend from last 14 days ────────────
-    # slope = how much revenue changes per day (can be negative = declining)
-    if len(real_daily) >= 14:
-        recent = np.array(real_daily[-14:], dtype=float)
-        x_idx  = np.arange(len(recent))
-        slope, intercept = np.polyfit(x_idx, recent, 1)
-        # Cap slope to ±5% of mean per day to avoid runaway trends
-        max_slope = hist_mean_30 * 0.05
+    # ── Trend: fit on last 60 days, cap at ±2% per day ───────────
+    if len(recent_vals) >= 14:
+        x_idx  = np.arange(len(recent_vals))
+        slope, _ = np.polyfit(x_idx, recent_vals, 1)
+        max_slope = recent_mean * 0.02          # cap: ±2% of mean per day
         slope = float(np.clip(slope, -max_slope, max_slope))
     else:
         slope = 0.0
 
-    # ── Step 4: Recursive forecast loop ───────────────────────────
-    preds           = []
-    predicted_daily = []   # grows as we generate each step
+    # ── Seasonal naive: last N matching weekdays ──────────────────
+    def seasonal_naive(target_date: pd.Timestamp, n_weeks: int = 6) -> float:
+        """Average of the last n_weeks same-weekday values from real history."""
+        dow = target_date.dayofweek
+        same_dow = daily[daily["DayOfWeek"] == dow]["Amount"].values
+        if len(same_dow) == 0:
+            return recent_mean
+        # Take last n_weeks occurrences
+        sample = same_dow[-n_weeks:]
+        return float(np.median(sample))
+
+    # ── ML model lags (for the 30% model blend) ──────────────────
+    predicted_daily = []
 
     def _lookback(n: int) -> float:
-        """Get value n steps back: real history first, then our predictions."""
-        combined = real_daily + predicted_daily
-        if len(combined) >= n:
-            return float(combined[-n])
-        return hist_mean_30
+        combined = list(real_amounts) + predicted_daily
+        return float(combined[-n]) if len(combined) >= n else recent_mean
+
+    # ── Forecast loop ─────────────────────────────────────────────
+    rng   = np.random.default_rng(seed=42)   # fixed seed = reproducible noise
+    preds = []
 
     for i in range(1, days + 1):
         nd = last_date + pd.Timedelta(days=i)
 
-        # Real-history lags (stay in real data for first 30 steps)
+        # --- Layer 1: Seasonal naive base (most important) ---
+        sn_base = seasonal_naive(nd, n_weeks=8)
+
+        # --- Layer 2: Apply month seasonality on top ---
+        sn_base *= month_ratio.get(nd.month, 1.0)
+
+        # --- Layer 3: ML model prediction (minor signal) ---
         lag_1  = _lookback(1)
         lag_7  = _lookback(7)
         lag_30 = _lookback(30)
-
-        combined_all    = real_daily + predicted_daily
+        combined_all    = list(real_amounts) + predicted_daily
         rolling_mean_7  = float(np.mean(combined_all[-7:]))
         rolling_mean_30 = float(np.mean(combined_all[-30:]))
-        rolling_std_7   = float(np.std(combined_all[-7:]))  if len(combined_all) >= 2 else hist_std_30
+        rolling_std_7   = float(np.std(combined_all[-7:])) if len(combined_all) >= 2 else recent_std
         ewm_7           = float(pd.Series(combined_all).ewm(span=7, adjust=False).mean().iloc[-1])
 
         row = {
-            "Month":           float(nd.month),
-            "DayOfWeek":       float(nd.dayofweek),
-            "Week":            float(nd.isocalendar().week),
-            "Quarter":         float(nd.quarter),
-            "IsWeekend":       float(int(nd.dayofweek >= 5)),
-            "DayOfMonth":      float(nd.day),
-            "Qty":             avg_qty,
-            "lag_1":           lag_1,
-            "lag_7":           lag_7,
-            "lag_30":          lag_30,
-            "rolling_mean_7":  rolling_mean_7,
-            "rolling_mean_30": rolling_mean_30,
-            "rolling_std_7":   rolling_std_7,
-            "ewm_7":           ewm_7,
-            "Category":        top_category,
-            "ship-state":      top_state,
-            "B2B":             "B2C",
+            "Month": float(nd.month), "DayOfWeek": float(nd.dayofweek),
+            "Week": float(nd.isocalendar().week), "Quarter": float(nd.quarter),
+            "IsWeekend": float(int(nd.dayofweek >= 5)), "DayOfMonth": float(nd.day),
+            "Qty": avg_qty, "lag_1": lag_1, "lag_7": lag_7, "lag_30": lag_30,
+            "rolling_mean_7": rolling_mean_7, "rolling_mean_30": rolling_mean_30,
+            "rolling_std_7": rolling_std_7, "ewm_7": ewm_7,
+            "Category": top_category, "ship-state": top_state, "B2B": "B2C",
         }
+        ml_pred = float(predict_single(row, feat_cols, model))
+        # Clamp ML prediction to ±50% of seasonal naive (stop it dominating)
+        ml_pred = float(np.clip(ml_pred, sn_base * 0.5, sn_base * 1.5))
 
-        # Base model prediction
-        base_pred = float(predict_single(row, feat_cols, model))
+        # --- Layer 4: Blend seasonal (70%) + ML (30%) ---
+        blended = 0.70 * sn_base + 0.30 * ml_pred
 
-        # Apply day-of-week seasonality: if model ignores DoW variation,
-        # we enforce it explicitly using the ratio learned from history
-        dow_adj   = dow_ratio.get(nd.dayofweek, 1.0)
-        month_adj = month_ratio.get(nd.month, 1.0)
+        # --- Layer 5: Apply gentle trend ---
+        blended += slope * i
 
-        # Blend model output with seasonal-adjusted recent mean
-        # weight=0.6 on model, 0.4 on seasonal baseline → prevents flat line
-        seasonal_base = hist_mean_30 * dow_adj * month_adj
-        blended = 0.6 * base_pred + 0.4 * seasonal_base
+        # --- Layer 6: Add realistic noise (±6% of recent std) ---
+        # This creates the natural highs & lows, seeded per-day for reproducibility
+        noise = rng.normal(0, recent_std * 0.06)
+        final = blended + noise
 
-        # Apply trend: add slope × step_number
-        trend_adj = blended + slope * i
+        # --- Safety clamp ---
+        final = float(np.clip(final, recent_mean * 0.2, recent_mean * 2.5))
 
-        # Add small realistic noise (±3% of recent mean) so lines don't look robotic
-        noise = np.random.default_rng(seed=i).normal(0, hist_std_30 * 0.03)
-        final_pred = trend_adj + noise
-
-        # Safety clamp: never go below 10% of mean or above 400% of mean
-        final_pred = float(np.clip(final_pred, hist_mean_30 * 0.1, hist_mean_30 * 4.0))
-
-        preds.append({"Date": nd, "Forecast": final_pred})
-        predicted_daily.append(final_pred)
+        preds.append({"Date": nd, "Forecast": final})
+        predicted_daily.append(final)
 
     return pd.DataFrame(preds)
 
@@ -317,10 +312,6 @@ def build_forecast(df_full: pd.DataFrame, model, feat_cols: list[str],
 # ═══════════════════════════════════════════════════════════════
 # Page layout helpers
 # ═══════════════════════════════════════════════════════════════
-
-def kpi_card(col, label: str, value: str, delta: str | None = None) -> None:
-    col.metric(label, value, delta)
-
 
 def section(title: str) -> None:
     st.markdown(f"""
@@ -450,12 +441,12 @@ def main() -> None:
     next_day_pred = predict_single(next_day_row, feat_cols, sel_model)
 
     k1, k2, k3, k4, k5, k6 = st.columns(6)
-    kpi_card(k1, "💰 Total Revenue",      f"₹{total_rev:,.0f}")
-    kpi_card(k2, "🛒 Total Orders",       f"{total_orders:,}")
-    kpi_card(k3, "📦 Avg Order Value",    f"₹{aov:,.2f}")
-    kpi_card(k4, "🏆 Top Category",       str(top_cat))
-    kpi_card(k5, "📍 Top State",          str(top_state))
-    kpi_card(k6, "🔮 Next-Day Forecast",  f"₹{next_day_pred:,.0f}")
+    k1.metric("💰 Total Revenue", f"₹{total_rev:,.0f}")
+    k2.metric("🛒 Total Orders", f"{total_orders:,}")
+    k3.metric("📦 Avg Order Value", f"₹{aov:,.2f}")
+    k4.metric("🏆 Top Category", str(top_cat))
+    k5.metric("📍 Top State", str(top_state))
+    k6.metric("🔮 Next-Day Forecast", f"₹{next_day_pred:,.0f}")
 
     # ── Monthly revenue line chart ────────────────────────────────
     section("📅 Revenue Over Time")
@@ -590,10 +581,17 @@ def main() -> None:
                                 line=dict(color=MODEL_COLORS.get(sel_model_name, ACCENT),
                                           width=2.2, dash="dot"),
                                 marker=dict(size=5)))
-    # add_vline needs a numeric Unix-ms timestamp when x-axis is datetime
-    last_ts = int(pd.Timestamp(df_full["Date"].max()).timestamp() * 1000)
-    fig_fc.add_vline(x=last_ts, line_dash="dot",
-                     line_color="#8B949E", annotation_text="Today")
+    today_marker = pd.Timestamp(df_full["Date"].max())
+    fig_fc.add_vline(x=today_marker, line_dash="dot", line_color="#8B949E")
+    fig_fc.add_annotation(
+        x=today_marker,
+        y=1,
+        yref="paper",
+        text="Today",
+        showarrow=False,
+        yshift=10,
+        font=dict(color="#8B949E", size=11),
+    )
     fig_fc.update_layout(template=PLOTLY_TEMPLATE,
                           title=f"{forecast_days}-Day Revenue Forecast",
                           xaxis_title="Date", yaxis_title="Revenue (₹)",
